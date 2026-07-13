@@ -60,6 +60,24 @@ backbuf_surface(lumen_window_t *win)
 
 static void log_console(const char *msg) { write(2, msg, strlen(msg)); }
 
+/* ── Capsule geometry ─────────────────────────────────────────────────────
+ * lumen's compositor tints a frosted-panel client's WHOLE window footprint
+ * uniformly (see lumen_server.c) — there's no way to leave part of a window
+ * untinted. So the window itself must BE the capsule (narrow, centered) at
+ * rest, only growing to full screen width while a dropdown/toast needs the
+ * room (see needed_width/needed_height). The server centers a top-anchored
+ * panel on its requested width and always places it at y=0, so:
+ *   - at rest:  request bw wide  -> server centers it at x=BAR_MARGIN_SIDE.
+ *   - dropdown: request fb_w wide -> centers to x=0 (matches the dropdown
+ *     code's screen-absolute-style coordinates, e.g. MENU_X, unchanged).
+ * s_win_x tracks whichever the server actually placed us at (from the
+ * create/resize reply) so capsule content can always be drawn/hit-tested at
+ * its fixed screen position (BAR_MARGIN_SIDE) via a one-line offset,
+ * regardless of which of the two window widths is currently in effect. */
+static int s_win_x;
+
+static int cap_off(void) { return BAR_MARGIN_SIDE - s_win_x; }
+
 /* ── Aegis menu (top-left brand icon click) ───────────────────────────────
  * Ported verbatim from lumen's old in-process menu, minus compositor-only
  * actions (About/Lock/Reboot/Poweroff now go back to lumen via
@@ -190,11 +208,14 @@ static int vol_open;
 static glyph_rect_t
 vol_popup_rect(void)
 {
-    int ix = topbar_volume_icon_x(s_fb_w, s_clock_str);
+    /* topbar_volume_icon_x is capsule-local; +cap_off() makes it absolute
+     * (this rect is drawn on the full, screen-absolute surface — see
+     * render()/needed_width()). */
+    int ix = topbar_volume_icon_x(s_fb_w - 2 * BAR_MARGIN_SIDE, s_clock_str) + cap_off();
     int x = ix + 5 - VOLP_W / 2;
     if (x < 4) x = 4;
     if (x + VOLP_W > s_fb_w - 4) x = s_fb_w - 4 - VOLP_W;
-    int y = BAR_MARGIN_TOP + BAR_H + 6;
+    int y = BAR_H + 6;
     return (glyph_rect_t){x, y, VOLP_W, VOLP_H};
 }
 
@@ -276,6 +297,8 @@ static void draw_wifi_glyph(surface_t *s, int cx, int cy, uint32_t col)
     draw_circle_filled(s, cx, cy, 2, col);
 }
 
+/* screen_w here is the capsule's own width (bw) — this is only ever called
+ * to draw/position within the capsule's sub-surface, never absolutely. */
 static int wifi_icon_cx(int screen_w)
 {
     return topbar_volume_icon_x(screen_w, s_clock_str) - 26;
@@ -284,7 +307,7 @@ static int wifi_icon_cx(int screen_w)
 static void draw_wifi_status(surface_t *s, int screen_w)
 {
     int cx = wifi_icon_cx(screen_w);
-    int cy = BAR_MARGIN_TOP + BAR_H - 7;
+    int cy = BAR_H - 7;
     uint32_t col = (s_wifi_n > 0) ? THEME_TEXT : THEME_TEXT_DIM;
     draw_wifi_glyph(s, cx, cy, col);
 }
@@ -319,11 +342,11 @@ static void draw_hwmon_status(surface_t *s, int screen_w)
 {
     int wifi_cx = wifi_icon_cx(screen_w);
     int right   = wifi_cx - 20;
-    int ty      = (TOPBAR_HEIGHT - 13) / 2;
+    int ty      = (BAR_H - 13) / 2;
 
     if (s_hw.battery_present) {
         const int BW = 22, BH = 11, NUB = 2;
-        int by = (TOPBAR_HEIGHT - BH) / 2;
+        int by = (BAR_H - BH) / 2;
         int bx = right - NUB - BW;
         uint32_t col = s_hw.battery_charging ? THEME_ACCENT
                                              : batt_color(s_hw.battery_percent);
@@ -373,6 +396,11 @@ static const lumen_set_menu_t *appmenu_current(void)
     return s_menu_state.col_count > 0 ? &s_menu_state : NULL;
 }
 
+/* Titles are drawn in capsule-local coordinates (this runs on the capsule
+ * sub-surface); appmenu_col_x[] is recorded capsule-local too, so
+ * appmenu_col_at()'s hit-test (also given capsule-local mx) stays consistent
+ * — appmenu_dropdown_rect() is the one place that converts a column's
+ * position to absolute (+cap_off()) for the dropdown box itself. */
 static void appmenu_draw_titles(surface_t *s)
 {
     appmenu_ncols = 0;
@@ -380,7 +408,7 @@ static void appmenu_draw_titles(surface_t *s)
     if (!m) return;
 
     int fh = g_font_ui ? font_height(g_font_ui, 14) : 12;
-    int ty = BAR_MARGIN_TOP + (BAR_H - fh) / 2;
+    int ty = (BAR_H - fh) / 2;
     int x  = topbar_appmenu_x();
     for (int c = 0; c < (int)m->col_count && c < LUMEN_MENU_MAX_COLS; c++) {
         const char *title = m->cols[c].title;
@@ -388,7 +416,7 @@ static void appmenu_draw_titles(surface_t *s)
                            : (int)strlen(title) * 8;
         int w = tw + 2 * APPMENU_TITLE_PAD;
         if (c == appmenu_open)
-            draw_blend_rounded_rect(s, x, BAR_MARGIN_TOP + 2, w, BAR_H - 4, 6,
+            draw_blend_rounded_rect(s, x, 2, w, BAR_H - 4, 6,
                                     0x00FFFFFF, 34);
         if (g_font_ui)
             font_draw_text(s, g_font_ui, 14, x + APPMENU_TITLE_PAD, ty, title,
@@ -418,9 +446,11 @@ static glyph_rect_t appmenu_dropdown_rect(void)
     for (int i = 0; i < (int)col->item_count; i++)
         h += col->items[i].label[0] ? APPMENU_ITEM_H : APPMENU_SEP_H;
     h += 8;
-    int x = (appmenu_open < appmenu_ncols) ? appmenu_col_x[appmenu_open]
-                                           : topbar_appmenu_x();
-    int y = BAR_MARGIN_TOP + BAR_H + 4;
+    /* col_x is capsule-local; +cap_off() makes it absolute (this rect is
+     * drawn/hit-tested on the full, screen-absolute surface). */
+    int x = ((appmenu_open < appmenu_ncols) ? appmenu_col_x[appmenu_open]
+                                            : topbar_appmenu_x()) + cap_off();
+    int y = BAR_H + 4;
     if (x + w > s_fb_w - 4) x = s_fb_w - 4 - w;
     if (x < 4) x = 4;
     return (glyph_rect_t){x, y, w, h};
@@ -458,9 +488,11 @@ static void appmenu_dropdown_draw(surface_t *s)
     }
 }
 
+/* mx,my here are capsule-local (see the header comment on appmenu_draw_titles
+ * — callers must translate window-local mouse coords by cap_off() first). */
 static int appmenu_col_at(int mx, int my)
 {
-    if (my < BAR_MARGIN_TOP || my >= BAR_MARGIN_TOP + BAR_H) return -1;
+    if (my < 0 || my >= BAR_H) return -1;
     for (int c = 0; c < appmenu_ncols; c++)
         if (mx >= appmenu_col_x[c] && mx < appmenu_col_x[c] + appmenu_col_w[c])
             return c;
@@ -525,14 +557,21 @@ static void notify_draw(surface_t *s, int screen_w)
 }
 
 /* ── Layout / render ──────────────────────────────────────────────────────
- * The window is normally just TOPBAR_HEIGHT tall; it grows via
- * LUMEN_OP_RESIZE_SELF to cover whichever dropdown/toast is showing (the
- * server keeps it full-width + top-anchored across resizes — see lumen's
- * handle_resize_self), and shrinks back once nothing needs the extra
- * height. */
+ * At rest the window is just the capsule (bw x BAR_H, see cap_off()'s header
+ * comment). It grows via LUMEN_OP_RESIZE_SELF to full screen width/whatever
+ * height a dropdown or the notification toast needs — those are all drawn
+ * with screen-absolute-style coordinates (MENU_X, MENU_Y, etc.) that are
+ * only valid once the window actually spans x=[0,fb_w) — and shrinks back
+ * once nothing needs the extra room. */
+static int needed_width(void)
+{
+    int any_open = menu_open || vol_open || appmenu_open >= 0 || notify_active();
+    return any_open ? s_fb_w : (s_fb_w - 2 * BAR_MARGIN_SIDE);
+}
+
 static int needed_height(void)
 {
-    int h = TOPBAR_HEIGHT;
+    int h = BAR_H;
     if (menu_open) {
         glyph_rect_t r = menu_rect();
         if (r.y + r.h > h) h = r.y + r.h;
@@ -560,11 +599,26 @@ static void render(lumen_window_t *win)
     for (int i = 0; i < s.w * s.h; i++)
         s.buf[i] = C_TERM_BG;
 
-    topbar_draw(&s, s_fb_w, s_clock_str, s_volume, 1 /* always recompute —
+    /* Capsule content draws into a sub-surface offset by cap_off() so it
+     * always lands at screen x=BAR_MARGIN_SIDE, regardless of whether our
+     * own window is currently the narrow at-rest capsule (offset 0) or the
+     * full-width dropdown-open size (offset BAR_MARGIN_SIDE). A real,
+     * bounds-safe view into our own buffer (row stride unchanged) — see
+     * cap_off()'s header comment. */
+    int bw = s_fb_w - 2 * BAR_MARGIN_SIDE;
+    surface_t cap = s;
+    cap.buf += cap_off();
+    cap.w = bw;
+    cap.h = BAR_H;
+    topbar_draw(&cap, bw, s_clock_str, s_volume, 1 /* always recompute —
                  we redraw from a fresh key-color buffer every frame */);
-    draw_wifi_status(&s, s_fb_w);
-    draw_hwmon_status(&s, s_fb_w);
-    appmenu_draw_titles(&s);
+    draw_wifi_status(&cap, bw);
+    draw_hwmon_status(&cap, bw);
+    appmenu_draw_titles(&cap);
+
+    /* Dropdowns/toast draw on the full surface at screen-absolute-style
+     * coordinates — only meaningful (and only ever open) while the window
+     * is actually full width, i.e. s_win_x == 0. */
     menu_draw(&s);
     vol_popup_draw(&s);
     appmenu_dropdown_draw(&s);
@@ -573,23 +627,32 @@ static void render(lumen_window_t *win)
     lumen_window_present(win);
 }
 
-/* Resize (if the required height changed) then repaint. win's fields are
+/* Resize (if the required size changed) then repaint. win's fields are
  * updated in place by lumen_window_resize_self — no need to rebind callers. */
 static void relayout_and_render(lumen_window_t *win)
 {
-    int h = needed_height();
-    if (h != win->h)
-        lumen_window_resize_self(win, s_fb_w, h);
+    int w = needed_width(), h = needed_height();
+    if (w != win->w || h != win->h)
+        lumen_window_resize_self(win, w, h);
+    s_win_x = win->x;
     render(win);
 }
 
 /* ── Mouse handling ───────────────────────────────────────────────────────
- * x,y arrive window-local per the protocol; since this panel is always
- * anchored at screen (0,0), window-local == screen-absolute, so every
- * hit-test below (written for screen coordinates originally) is unchanged. */
+ * x,y arrive window-local per the protocol. Dropdown/toast hit-tests
+ * (menu_hit_test, appmenu_item_at, vol_popup_hit/vol_from_y) use x,y
+ * directly — they're only reachable while the window is full width at
+ * x=0, matching their screen-absolute-style formulas. Capsule-content hit-
+ * tests (topbar_hit_aegis, topbar_volume_icon_hit, appmenu_col_at) need
+ * window-local x translated to capsule-local via cap_off() first — see its
+ * header comment — since the capsule isn't necessarily at window-local
+ * x=0 (it is when idle, but sits at x=BAR_MARGIN_SIDE once the window has
+ * grown to full width for an open dropdown). */
 static void handle_mouse(lumen_window_t *win, int fd, const lumen_event_t *ev)
 {
     int x = ev->mouse.x, y = ev->mouse.y;
+    int bw = s_fb_w - 2 * BAR_MARGIN_SIDE;
+    int cx = x - cap_off();
     int redraw = 0;
 
     if (ev->mouse.evtype == LUMEN_MOUSE_UP) {
@@ -627,7 +690,7 @@ static void handle_mouse(lumen_window_t *win, int fd, const lumen_event_t *ev)
             menu_open = 0; menu_hover = -1;
             redraw = 1;
         } else if (appmenu_open >= 0) {
-            int col  = appmenu_col_at(x, y);
+            int col  = appmenu_col_at(cx, y);
             int item = appmenu_item_at(x, y);
             if (col >= 0) {
                 appmenu_open = (col == appmenu_open) ? -1 : col;
@@ -643,7 +706,7 @@ static void handle_mouse(lumen_window_t *win, int fd, const lumen_event_t *ev)
                 appmenu_open = -1; appmenu_hover = -1;
             }
             redraw = 1;
-        } else if (vol_open && !topbar_volume_icon_hit(x, y, s_fb_w, s_clock_str)) {
+        } else if (vol_open && !topbar_volume_icon_hit(cx, y, bw, s_clock_str)) {
             if (vol_popup_hit(x, y)) {
                 set_volume(vol_from_y(y));
                 s_vol_drag = 1;
@@ -652,20 +715,20 @@ static void handle_mouse(lumen_window_t *win, int fd, const lumen_event_t *ev)
             }
             redraw = 1;
         } else {
-            int col = appmenu_col_at(x, y);
+            int col = appmenu_col_at(cx, y);
             if (col >= 0) {
                 menu_open = 0; menu_hover = -1;
                 vol_open = 0;
                 appmenu_open = col; appmenu_hover = -1;
                 redraw = 1;
-            } else if (topbar_volume_icon_hit(x, y, s_fb_w, s_clock_str)) {
+            } else if (topbar_volume_icon_hit(cx, y, bw, s_clock_str)) {
                 vol_open = !vol_open;
                 if (vol_open) {
                     menu_open = 0; menu_hover = -1;
                     appmenu_open = -1; appmenu_hover = -1;
                 }
                 redraw = 1;
-            } else if (topbar_hit_aegis(x, y, s_fb_w)) {
+            } else if (topbar_hit_aegis(cx, y, bw)) {
                 menu_open = !menu_open; menu_hover = -1;
                 if (menu_open) {
                     vol_open = 0;
@@ -772,10 +835,12 @@ int main(void)
 
     font_init();
 
-    /* Requested width is ignored for a top-anchored panel — the server
-     * always stretches it to the full screen width (see lumen's
-     * handle_create_common). Height is honored. */
-    lumen_window_t *win = lumen_panel_create_anchored(fd, 1, TOPBAR_HEIGHT,
+    /* We don't know the real screen width yet — request a deliberately
+     * oversized panel; the server clamps it to fb.w (same as a fullscreen
+     * window's reply reveals fb.w/fb.h), so the reply tells us the truth
+     * and this first window is (as a side effect) full-width. Immediately
+     * relayout below shrinks it to the real at-rest capsule size. */
+    lumen_window_t *win = lumen_panel_create_anchored(fd, 65535, TOPBAR_HEIGHT,
                                                        LUMEN_PANEL_TOP);
     if (!win) {
         log_console("[SHELL] FAIL: panel_create_anchored returned NULL\n");
@@ -783,10 +848,11 @@ int main(void)
         return 1;
     }
     s_fb_w = win->w;
+    s_win_x = win->x;
 
     wifi_refresh();
     hwmon_refresh();
-    render(win);
+    relayout_and_render(win);
 
     log_console("[SHELL] ready\n");
 
