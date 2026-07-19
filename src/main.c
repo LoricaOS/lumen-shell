@@ -591,13 +591,47 @@ static int needed_height(void)
     return h;
 }
 
+/* Paint the frosted-glass key over one rectangle of our surface, clipped to
+ * it. Everything we do NOT paint stays C_PANEL_CLEAR, which the compositor
+ * leaves as plain desktop. */
+static void
+glass_rect(surface_t *s, int x, int y, int w, int h)
+{
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > s->w) w = s->w - x;
+    if (y + h > s->h) h = s->h - y;
+    for (int r = 0; r < h; r++) {
+        uint32_t *row = &s->buf[(size_t)(y + r) * s->pitch + x];
+        for (int c = 0; c < w; c++)
+            row[c] = C_TERM_BG;
+    }
+}
+
 static void render(lumen_window_t *win)
 {
     surface_t s = backbuf_surface(win);
-    /* Key-color base: lumen's compositor replaces every C_TERM_BG pixel with
-     * a real blur+tint of the desktop behind us (see the file header). */
+    /* Cut-out base: the compositor frosts a panel across its WHOLE rectangle,
+     * and while a dropdown is open our rectangle is the full screen width.
+     * Start everything as C_PANEL_CLEAR (leave the desktop alone) and paint
+     * the frost key back only under the bar and under whatever is open —
+     * otherwise the empty space around a 160px menu became a screen-wide
+     * translucent slab. */
     for (int i = 0; i < s.w * s.h; i++)
-        s.buf[i] = C_TERM_BG;
+        s.buf[i] = C_PANEL_CLEAR;
+
+    /* The bar capsule itself is always glass. */
+    glass_rect(&s, cap_off(), 0, s_fb_w - 2 * BAR_MARGIN_SIDE, BAR_H);
+
+    /* ...and so is each open dropdown/toast, which tints over it (alpha 180). */
+    if (menu_open)          { glyph_rect_t r = menu_rect();
+                              glass_rect(&s, r.x, r.y, r.w, r.h); }
+    if (vol_open)           { glyph_rect_t r = vol_popup_rect();
+                              glass_rect(&s, r.x, r.y, r.w, r.h); }
+    if (appmenu_open >= 0)  { glyph_rect_t r = appmenu_dropdown_rect();
+                              glass_rect(&s, r.x, r.y, r.w, r.h); }
+    if (notify_active())    glass_rect(&s, s_fb_w - NOTIF_W - 16,
+                                       TOPBAR_HEIGHT + 14, NOTIF_W, NOTIF_H);
 
     /* Capsule content draws into a sub-surface offset by cap_off() so it
      * always lands at screen x=BAR_MARGIN_SIDE, regardless of whether our
