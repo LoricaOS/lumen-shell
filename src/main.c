@@ -35,6 +35,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <time.h>
 #include <sys/syscall.h>
 #include <stdint.h>
@@ -608,6 +609,26 @@ glass_rect(surface_t *s, int x, int y, int w, int h)
     }
 }
 
+/* boot_mark — timestamped boot-profiling milestone on CLOCK_MONOTONIC (same
+ * base as vigil's [PROF] marks). Boot-profiling only. */
+static void
+boot_mark(const char *phase)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return;
+    unsigned long ms = (unsigned long)ts.tv_sec * 1000UL +
+                       (unsigned long)(ts.tv_nsec / 1000000L);
+    char pbuf[96];
+    int pn = snprintf(pbuf, sizeof(pbuf), "[PROF] %lu ms %s\n", ms, phase);
+    if (pn <= 0) return;
+    /* /dev/console = the kernel console (serial on the Pi). Use it, not fd 2:
+     * once bastion starts the graphical session, lumen and its children get
+     * stderr redirected off serial, so fd-2 marks never reach the boot log. */
+    int cfd = open("/dev/console", O_WRONLY);
+    if (cfd >= 0) { write(cfd, pbuf, (size_t)pn); close(cfd); }
+    else write(2, pbuf, (size_t)pn);
+}
+
 static void render(lumen_window_t *win)
 {
     surface_t s = backbuf_surface(win);
@@ -659,6 +680,8 @@ static void render(lumen_window_t *win)
     notify_draw(&s, s_fb_w);
 
     lumen_window_present(win);
+    static int s_first = 0;
+    if (!s_first) { s_first = 1; boot_mark("shell-first-frame"); }
 }
 
 /* Resize (if the required size changed) then repaint. win's fields are
@@ -853,6 +876,10 @@ static void tick(lumen_window_t *win)
 int main(void)
 {
     int fd = -1;
+    long backoff_us = 2000;   /* fast poll then back off to 128ms — see the dock
+                               * for the rationale (flat 200ms wasted ~170ms of
+                               * time-to-desktop; the cap keeps a greeter login
+                               * that takes minutes from busy-spinning). */
     for (;;) {
         fd = lumen_connect();
         if (fd >= 0) break;
@@ -863,8 +890,9 @@ int main(void)
             if (n > 0) log_console(buf);
             return 1;
         }
-        struct timespec ts = { 0, 200 * 1000 * 1000 };
+        struct timespec ts = { 0, backoff_us * 1000 };
         nanosleep(&ts, NULL);
+        if (backoff_us < 128000) backoff_us *= 2;
     }
 
     font_init();
